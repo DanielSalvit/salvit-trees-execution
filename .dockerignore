@@ -1,0 +1,8 @@
+venv
+env
+.env
+main.ipynb
+*.json
+inputs
+__pycache__
+dev.ipynb
