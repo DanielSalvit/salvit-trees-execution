@@ -223,7 +223,7 @@ def get_treeData_df(df,
     'D+': 67,
     'D' : 63,
     'D-': 60,
-    'F' : 0}
+    'F' : 50}
 
     columnas_finales = [col for col in columnas_orden if col in result_df.columns] + \
                        [col for col in result_df.columns if col not in columnas_orden]
@@ -248,7 +248,7 @@ def get_treeData_df(df,
     return result_df
 
 def main():
-
+    print("Starting the process")
     project_id = os.environ.get('PROJECT_ID')
     dataset_id = os.environ.get('DATASET_ID')
 
@@ -302,10 +302,11 @@ def main():
 
     client_id = input_df["client_id"][0]
     input_date = input_df["input_date"][0]
-
+    print("data gotten from the sheet")
     dates_df = generate_comparison_table(input_date)
 
     df = gbq_client.query(f"select * from `{project_id}.{dataset_id}.vs_revenue_tree_customer_sale_type` where client_id = '{client_id}'").to_dataframe()
+    print("data gotten from the bigquery")
     df["partion"] = df["customer_type"] + " " + df["target_type"]
     data_partions_rankings_df = adjust_data_partions_rankings_df(df, data_partions_rankings_df)
     variable_rankings_df = adjust_variable_rankings_df(df, variable_rankings_df) 
