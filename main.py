@@ -1183,17 +1183,14 @@ def main():
         "agent_1"
     )
 
-
-
     df_treeData  = pd.DataFrame(tree_result["treeData"])
     dates_df = tree_result["dates_df"]
     
-
     df_treeData["client_id"] = client_id
 
     creds = ServiceAccountCredentials.from_json_keyfile_dict(google_sheets_credentials, scope)
     client_spreed_sheet = gspread.authorize(creds)
-    sheet = client_spreed_sheet.open_by_url(sheet_url)
+    sheet = client_spreed_sheet.open_by_url(main_sheet_url)
 
     worksheet = sheet.worksheet('results')
     worksheet.clear()
