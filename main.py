@@ -1169,7 +1169,7 @@ def main():
     agents_url_df = pd.DataFrame(agents_url[1:], columns=agents_url[0])
     agents_url_df = agents_url_df.applymap(adjust_value_spreedsheet)
 
-    sheet_url = agents_url_df[agents_url_df["super_agent"] == tree_name]["sheet_url"].iloc[0]
+    sheet_url = agents_url_df[agents_url_df["super_agent"] == tree_name]["url"].iloc[0]
 
     tree_result = get_tree_data_by_id(
         tree_name,
