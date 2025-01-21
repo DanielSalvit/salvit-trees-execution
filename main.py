@@ -600,13 +600,13 @@ def get_marketing_treeData_df(df,
         'roas': lambda df_: np.where(
             df_['marketing_spend'] == 0,
             0,
-            (df_['marketing_revenue']) / df_['marketing_spend']
+            (df_['new_customers_revenue']) / df_['marketing_spend']
         ),
 
         'cvr': lambda df_: np.where(
-            df_['marketing_clicks'] == 0,
+            df_['visits'] == 0,
             0,
-            (df_['marketing_conversions']) / df_['marketing_clicks']
+            (df_['totalPurchasers']) / df_['visits']
         ),
 
         'cpm': lambda df_: np.where(
@@ -628,9 +628,10 @@ def get_marketing_treeData_df(df,
         'order_revenue',
         'new_customers',
         'marketing_clicks',
-        'marketing_conversions',
         'marketing_impressions',
-        'marketing_revenue'
+        'visits',
+        'totalPurchasers',
+        'new_customers_revenue'
         ]
 
 
