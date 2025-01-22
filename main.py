@@ -534,6 +534,15 @@ def marketing_tree(
     if df['order_date'].dtype != 'datetime64[ns]':
         df['order_date'] = pd.to_datetime(df['order_date'], errors='coerce')
 
+
+    query = f"""
+    SELECT marketing_channel, order_date, marketing_spend   
+    FROM `{project_id}.{dataset_id}.vs_marketing_tree_channel_mix` 
+    WHERE client_id = '{client_id}'
+    """
+    df_marketing_channel = gbq_client.query(query).to_dataframe()
+
+
     variable_rankings_df = adjust_marketing_variable_rankings_df(df, variable_rankings_df)
     unique_vars = variable_rankings_df["column_name"].unique()
     change_variable_scoring_df = change_variable_scoring_df[change_variable_scoring_df["column_name"].isin(unique_vars)]
@@ -542,7 +551,7 @@ def marketing_tree(
 
     if agent == 'agent_1':
         dates_df = generate_comparison_table(date_str) 
-        df_treeData = get_marketing_treeData_df(df, dates_df, variable_rankings_df, date_fields_rankings_df, long_term_weighting_df, change_variable_scoring_df, absolute_variable_scoring_df)
+        df_treeData = get_marketing_treeData_df(df, df_marketing_channel, dates_df, variable_rankings_df, date_fields_rankings_df, long_term_weighting_df, change_variable_scoring_df, absolute_variable_scoring_df)
         treeMath_score = df_treeData["math_eval"].sum()
 
         results = {
@@ -555,32 +564,45 @@ def marketing_tree(
 
 
 
-def get_marketing_treeData_df(df, 
+def get_marketing_treeData_df(
+    df, 
+    df_marketing_channel,  # <--- DataFrame con columns: marketing_channel, order_date, marketing_spend
     dates_df, 
     variable_rankings_df, 
     date_fields_rankings_df,
     long_term_weighting_df,  
     change_variable_scoring_df,
     absolute_variable_scoring_df
-    ):
+):
 
-    date_columns = ['start_date', 'end_date', 'start_date_comparison', 'end_date_comparison']
-    for col in date_columns:
+    # =========================================================================
+    # 1) Asegurarnos de que las columnas de fechas sean datetime
+    # =========================================================================
+    date_cols = ['start_date', 'end_date', 'start_date_comparison', 'end_date_comparison']
+    for col in date_cols:
         if dates_df[col].dtype != 'datetime64[ns]':
             dates_df[col] = pd.to_datetime(dates_df[col], errors='coerce')
 
-    # Crear columnas para filtrar una sola vez
+    # Converting order_date en df principal
     df['order_date'] = pd.to_datetime(df['order_date'], errors='coerce')
-    df["partition"] = "all"
+    df['partition'] = 'all'  # Para este ejemplo, solo una partición
 
-    # Crear todas las combinaciones de fechas y variables
+    # Converting order_date en df_marketing_channel
+    df_marketing_channel['order_date'] = pd.to_datetime(df_marketing_channel['order_date'], errors='coerce')
+    df_marketing_channel['partition'] = 'all'
+
+    # =========================================================================
+    # 2) Generar las combinaciones de (fechas, variables)
+    # =========================================================================
     cross_df = (
         dates_df.assign(key=1)
         .merge(variable_rankings_df.assign(key=1), on='key', suffixes=('', '_var'))
         .drop(columns=['key'])
     )
 
-
+    # =========================================================================
+    # 3) Definir variables especiales y las columnas necesarias
+    # =========================================================================
     special_vars = {
         'mer': lambda df_: np.where(
             df_['marketing_spend'] == 0, 
@@ -593,36 +615,32 @@ def get_marketing_treeData_df(df,
             df_['marketing_spend'] / df_['new_customers']
         ),
         'marketing_spend_ratio': lambda df_: np.where(
-            (df_['order_revenue'] ) == 0,
+            df_['order_revenue'] == 0,
             0,
-            df_['marketing_spend'] / (df_['order_revenue'] )
+            df_['marketing_spend'] / df_['order_revenue']
         ),
         'roas': lambda df_: np.where(
             df_['marketing_spend'] == 0,
             0,
-            (df_['new_customers_revenue']) / df_['marketing_spend']
+            df_['new_customers_revenue'] / df_['marketing_spend']
         ),
-
         'cvr': lambda df_: np.where(
             df_['visits'] == 0,
             0,
-            (df_['totalPurchasers']) / df_['visits']
+            df_['totalPurchasers'] / df_['visits']
         ),
-
         'cpm': lambda df_: np.where(
             df_['marketing_impressions'] == 0,
             0,
-            (df_['marketing_spend']) / df_['marketing_impressions']
+            df_['marketing_spend'] / df_['marketing_impressions']
         ),
-
         'cpc': lambda df_: np.where(
             df_['marketing_clicks'] == 0,
             0,
-            (df_['marketing_spend']) / df_['marketing_clicks']
+            df_['marketing_spend'] / df_['marketing_clicks']
         )
     }
 
-    # Columns needed for special variables
     columns_needed_for_special = [
         'marketing_spend',
         'order_revenue',
@@ -632,42 +650,43 @@ def get_marketing_treeData_df(df,
         'visits',
         'totalPurchasers',
         'new_customers_revenue'
-        ]
+    ]
 
+    # Si existe la columna new_customers_subscribers, se agrega a las "special_vars"
+    if 'new_customers_subscribers' in df.columns:
+        new_subs_total = df["new_customers_subscribers"].sum()
+        if new_subs_total > 0:
+            special_vars["cts"] = lambda df_: np.where(
+                df_['new_customers'] == 0,
+                0,
+                df_['new_customers_subscribers'] / df_['new_customers']
+            )
+            columns_needed_for_special.append("new_customers_subscribers")
 
-    new_subs = df["new_customers_subscribers"].sum()
+    # =========================================================================
+    # 4A) Bucle para métricas normales (MER, CPA, etc.)
+    # =========================================================================
+    rows_metrics = []
 
-    if new_subs > 0:
-        special_vars["cts"] = lambda df_: np.where(
-            df_['new_customers'] == 0,
-            0,
-            (df_['new_customers_subscribers']) / df_['new_customers']
-        )
-        columns_needed_for_special.append("new_customers_subscribers")
+    for _, row_cross in cross_df.iterrows():
+        date_field = row_cross['date_field']
+        start_date = row_cross['start_date']
+        end_date = row_cross['end_date']
+        start_comp = row_cross['start_date_comparison']
+        end_comp = row_cross['end_date_comparison']
 
+        column_name = row_cross['column_name']
+        weight_variable_rankings = row_cross['weight']
 
-    rows = []
-
-    for _, row in cross_df.iterrows():
-        date_field = row['date_field']
-        start_date = row['start_date']
-        end_date = row['end_date']
-        start_comp = row['start_date_comparison']
-        end_comp = row['end_date_comparison']
-
-        column_name = row['column_name']
-        weight_variable_rankings = row['weight']
-
-        # Filtrar para período actual y de comparación
+        # Filtrar DF principal para actual y comparación
         df_current = df.loc[(df['order_date'] >= start_date) & (df['order_date'] <= end_date)]
         df_comparison = df.loc[(df['order_date'] >= start_comp) & (df['order_date'] <= end_comp)]
 
-        # Agrupar 'current'
+        # Calcular currentvalue
         if column_name in special_vars:
             current_agg = df_current.groupby('partition', as_index=False)[columns_needed_for_special].sum()
             current_agg['currentvalue'] = special_vars[column_name](current_agg)
             current_agg = current_agg[['partition', 'currentvalue']]
-        
         else:
             current_agg = (
                 df_current
@@ -675,12 +694,12 @@ def get_marketing_treeData_df(df,
                 .sum()
                 .rename(columns={column_name: 'currentvalue'})
             )
-            
+
+        # Calcular comparison_value
         if column_name in special_vars:
             comparison_agg = df_comparison.groupby('partition', as_index=False)[columns_needed_for_special].sum()
             comparison_agg['comparison_value'] = special_vars[column_name](comparison_agg)
             comparison_agg = comparison_agg[['partition', 'comparison_value']]
-        
         else:
             comparison_agg = (
                 df_comparison
@@ -688,92 +707,189 @@ def get_marketing_treeData_df(df,
                 .sum()
                 .rename(columns={column_name: 'comparison_value'})
             )
-            
 
-
+        # Combinar y calcular 'change'
         merged_agg = pd.merge(current_agg, comparison_agg, on='partition', how='outer').fillna(0)
-
-        # Calcular 'change' con np.where para evitar división por cero
         merged_agg['change'] = np.where(
             merged_agg['comparison_value'] == 0,
             1,
             (merged_agg['currentvalue'] - merged_agg['comparison_value']) / merged_agg['comparison_value']
         )
 
-        # Asignar variables adicionales
+        # Guardar columnas clave
         merged_agg['variable'] = column_name
         merged_agg['date_field'] = date_field
         merged_agg['weight_variable_rankings'] = weight_variable_rankings
-        rows.append(merged_agg)
 
+        rows_metrics.append(merged_agg)
 
-    result_df = pd.concat(rows, ignore_index=True)
+    # =========================================================================
+    # 4B) Bucle para spend mix (separado, para no duplicar)
+    # =========================================================================
+    rows_spend_mix = []
+
+    for _, row_dates in dates_df.iterrows():
+        date_field = row_dates['date_field']
+        start_date = row_dates['start_date']
+        end_date = row_dates['end_date']
+        start_comp = row_dates['start_date_comparison']
+        end_comp = row_dates['end_date_comparison']
+
+        # Filtrar df_marketing_channel
+        df_mc_current = df_marketing_channel.loc[
+            (df_marketing_channel['order_date'] >= start_date) &
+            (df_marketing_channel['order_date'] <= end_date)
+        ]
+        df_mc_comparison = df_marketing_channel.loc[
+            (df_marketing_channel['order_date'] >= start_comp) &
+            (df_marketing_channel['order_date'] <= end_comp)
+        ]
+
+        # -- Actual --
+        if not df_mc_current.empty:
+            cur_mix = df_mc_current.groupby(['partition','marketing_channel'], as_index=False)['marketing_spend'].sum()
+            total_spend_cur = cur_mix.groupby('partition', as_index=False)['marketing_spend'].sum()
+            total_spend_cur.rename(columns={'marketing_spend': 'total_spend_current'}, inplace=True)
+
+            cur_mix = cur_mix.merge(total_spend_cur, on='partition', how='left')
+            cur_mix['currentvalue'] = np.where(
+                cur_mix['total_spend_current'] == 0,
+                0,
+                cur_mix['marketing_spend'] / cur_mix['total_spend_current']
+            )
+        else:
+            # DataFrame vacío con columnas esperadas
+            cur_mix = pd.DataFrame(columns=['partition','marketing_channel','marketing_spend','total_spend_current','currentvalue'])
+
+        # -- Comparación --
+        if not df_mc_comparison.empty:
+            comp_mix = df_mc_comparison.groupby(['partition','marketing_channel'], as_index=False)['marketing_spend'].sum()
+            total_spend_comp = comp_mix.groupby('partition', as_index=False)['marketing_spend'].sum()
+            total_spend_comp.rename(columns={'marketing_spend': 'total_spend_comparison'}, inplace=True)
+
+            comp_mix = comp_mix.merge(total_spend_comp, on='partition', how='left')
+            comp_mix['comparison_value'] = np.where(
+                comp_mix['total_spend_comparison'] == 0,
+                0,
+                comp_mix['marketing_spend'] / comp_mix['total_spend_comparison']
+            )
+        else:
+            comp_mix = pd.DataFrame(columns=['partition','marketing_channel','marketing_spend','total_spend_comparison','comparison_value'])
+
+        # -- Unir actual y comparación --
+        mix_merged = pd.merge(
+            cur_mix[['partition','marketing_channel','currentvalue']],
+            comp_mix[['partition','marketing_channel','comparison_value']],
+            on=['partition','marketing_channel'],
+            how='outer'
+        ).fillna(0)
+
+        # -- Calcular change --
+        mix_merged['change'] = np.where(
+            mix_merged['comparison_value'] == 0,
+            1,
+            (mix_merged['currentvalue'] - mix_merged['comparison_value']) / mix_merged['comparison_value']
+        )
+
+        # -- Filtrar canales >= 7%
+        mask_7 = (mix_merged['currentvalue'] >= 0.07) | (mix_merged['comparison_value'] >= 0.07)
+        mix_merged = mix_merged[mask_7].copy()
+
+        # -- Crear filas con variable = "spend_mix_{channel}"
+        for _, row_mix in mix_merged.iterrows():
+            rows_spend_mix.append({
+                'partition': row_mix['partition'],
+                'variable': f"spend_mix_{row_mix['marketing_channel']}",
+                'date_field': date_field,
+                'currentvalue': row_mix['currentvalue'],
+                'comparison_value': row_mix['comparison_value'],
+                'change': row_mix['change'],
+                'weight_variable_rankings': 0  # Se forzará en 0
+            })
+
+    # =========================================================================
+    # 5) Unir las filas de métricas normales y las de spend mix
+    # =========================================================================
+    df_metrics = pd.concat(rows_metrics, ignore_index=True).fillna(0)
+    df_spend_mix = pd.DataFrame(rows_spend_mix).fillna(0) if rows_spend_mix else pd.DataFrame()
+
+    result_df = pd.concat([df_metrics, df_spend_mix], ignore_index=True).fillna(0)
+
+    # =========================================================================
+    # 6) Identificar variables "long term" vs "short term" y hacer merges
+    # =========================================================================
     long_term_vars = long_term_weighting_df["column_name"].unique()
 
     result_df_long_term = result_df[result_df["variable"].isin(long_term_vars)].copy()
-    result_df_short_term = result_df[~result_df["variable"].isin(long_term_vars)].copy() 
+    result_df_short_term = result_df[~result_df["variable"].isin(long_term_vars)].copy()
 
-    result_df_short_term = result_df.merge(
+    # -- Short term: merge con date_fields_rankings_df
+    result_df_short_term = result_df_short_term.merge(
         date_fields_rankings_df[['date_field', 'weight']], 
         on='date_field',
         how='inner'
     ).rename(columns={'weight': 'weight_date_fields'})
 
-
-    long_term_weighting_df.rename(columns={'column_name': 'variable'}, inplace=True)
-
+    # -- Long term: merge con long_term_weighting_df
+    df_ltw = long_term_weighting_df.rename(columns={'column_name': 'variable'}).copy()
     result_df_long_term = result_df_long_term.merge(
-        long_term_weighting_df[['date_field','variable' ,'weight']], 
+        df_ltw[['date_field','variable','weight']],
         on=['variable','date_field'],
         how='inner'
     ).rename(columns={'weight': 'weight_date_fields'})
 
+    # -- Unir ambos
     result_df = pd.concat([result_df_short_term, result_df_long_term], ignore_index=True)
 
-    scoring_dict = {}
+    # =========================================================================
+    # 7) Scoring para 'change' (change_grade)
+    # =========================================================================
+    scoring_dict_change = {}
     for var in change_variable_scoring_df['column_name'].unique():
         subset = change_variable_scoring_df[change_variable_scoring_df['column_name'] == var].sort_values('low_interval')
         bins = subset['low_interval'].tolist() + [np.inf]
         labels = subset['grade'].tolist()
-        scoring_dict[var] = (bins, labels)
+        scoring_dict_change[var] = (bins, labels)
 
-    # Función vectorizada para asignar 'grade'
-    def assign_grade(row):
+    def assign_change_grade(row):
         var = row['variable']
         chg = row['change']
-        if var not in scoring_dict or pd.isnull(chg):
+        if var not in scoring_dict_change or pd.isnull(chg):
             return np.nan
-        bins, labels = scoring_dict[var]
+        bins, labels = scoring_dict_change[var]
         idx = np.searchsorted(bins, chg, side='right') - 1
         if 0 <= idx < len(labels):
             return labels[idx]
         return np.nan
 
-    result_df['change_grade'] = result_df.apply(assign_grade, axis=1)
+    result_df['change_grade'] = result_df.apply(assign_change_grade, axis=1)
 
-
-    scoring_dict = {}
+    # =========================================================================
+    # 8) Scoring para 'absolute' (absolute_grade)
+    # =========================================================================
+    scoring_dict_abs = {}
     for var in absolute_variable_scoring_df['column_name'].unique():
         subset = absolute_variable_scoring_df[absolute_variable_scoring_df['column_name'] == var].sort_values('low_interval')
         bins = subset['low_interval'].tolist() + [np.inf]
         labels = subset['grade'].tolist()
-        scoring_dict[var] = (bins, labels)
+        scoring_dict_abs[var] = (bins, labels)
 
-
-    def assign_grade(row):
+    def assign_abs_grade(row):
         var = row['variable']
-        chg = row['currentvalue']
-        if var not in scoring_dict or pd.isnull(chg):
+        val = row['currentvalue']
+        if var not in scoring_dict_abs or pd.isnull(val):
             return np.nan
-        bins, labels = scoring_dict[var]
-        idx = np.searchsorted(bins, chg, side='right') - 1
+        bins, labels = scoring_dict_abs[var]
+        idx = np.searchsorted(bins, val, side='right') - 1
         if 0 <= idx < len(labels):
             return labels[idx]
         return np.nan
 
-    result_df['absolute_grade'] = result_df.apply(assign_grade, axis=1)
+    result_df['absolute_grade'] = result_df.apply(assign_abs_grade, axis=1)
 
-
+    # =========================================================================
+    # 9) Calcular grade combinando 'change_grade' y 'absolute_grade'
+    # =========================================================================
     grade_mapping = {
         'A+': 100, 'A': 95, 'A-': 90,
         'B+': 87.5, 'B': 85, 'B-': 80,
@@ -781,7 +897,6 @@ def get_marketing_treeData_df(df,
         'D+': 68.5, 'D': 65, 'D-': 62,
         'F': 50, 'NG': 0
     }
-
     grade_mapping_with_ng = {**grade_mapping, 'NG': 0}
 
     def numeric_to_letter(value):
@@ -814,50 +929,54 @@ def get_marketing_treeData_df(df,
         else:
             return 'NG'
 
-
     result_df['grade_numeric'] = (
         result_df['absolute_grade'].map(grade_mapping_with_ng).fillna(0) * 0.8 +
         result_df['change_grade'].map(grade_mapping_with_ng).fillna(0) * 0.2
     )
-
     result_df['grade'] = result_df['grade_numeric'].apply(numeric_to_letter)
 
-
+    # =========================================================================
+    # 10) Ordenar columnas y llenar nulos en weight
+    # =========================================================================
     columnas_orden = [
         'variable', 'date_field', 
         'currentvalue', 'comparison_value', 'change',
         'weight_variable_rankings', 'weight_date_fields', 'weight_data_partitions',
-        'change_grade', 'absolute_grade' ,'grade',
+        'change_grade', 'absolute_grade', 'grade',
         'grade_numeric'
     ]
-    columnas_finales = [
-        col for col in columnas_orden if col in result_df.columns
-    ] + [
-        col for col in result_df.columns if col not in columnas_orden
+    columnas_finales = [c for c in columnas_orden if c in result_df.columns] + [
+        c for c in result_df.columns if c not in columnas_orden
     ]
-
-
     result_df = result_df[columnas_finales]
     result_df['weight_variable_rankings'] = result_df['weight_variable_rankings'].fillna(0)
-    result_df['weight_date_fields'] = result_df['weight_date_fields'].fillna(0)
+    if 'weight_date_fields' in result_df.columns:
+        result_df['weight_date_fields'] = result_df['weight_date_fields'].fillna(0)
+    else:
+        result_df['weight_date_fields'] = 0
 
+    # Calcular "weight" total y "math_eval"
+    result_df['weight'] = result_df['weight_variable_rankings'] * result_df['weight_date_fields']
+    result_df['math_eval'] = result_df['grade_numeric'] * result_df['weight']
 
-    result_df['weight'] = (
-        result_df['weight_variable_rankings'] *
-        result_df['weight_date_fields'] 
-    )
+    # =========================================================================
+    # 11) Forzar weight=0 y grades="NG" para spend_mix
+    # =========================================================================
+    mask_spend_mix = result_df['variable'].str.startswith('spend_mix_')
+    result_df.loc[mask_spend_mix, 'weight'] = 0
+    result_df.loc[mask_spend_mix, 'change_grade'] = 'NG'
+    result_df.loc[mask_spend_mix, 'absolute_grade'] = 'NG'
+    result_df.loc[mask_spend_mix, 'grade'] = 'NG'
+    result_df.loc[mask_spend_mix, 'math_eval'] = 0
 
-    result_df["math_eval"] = result_df["grade_numeric"] * result_df["weight"]
+    # Eliminar columnas auxiliares
+    to_drop = ['grade_numeric', 'weight_variable_rankings', 'weight_date_fields']
+    for col in to_drop:
+        if col in result_df.columns:
+            result_df.drop(columns=col, inplace=True)
 
-    result_df.drop(
-        columns=[
-            'grade_numeric', 
-            'weight_variable_rankings', 
-            'weight_date_fields'
-        ],
-        inplace=True
-    )
     return result_df
+
 
 
 
