@@ -28,7 +28,8 @@ def revenue_tree(
     date_str,  
     google_sheets_credentials,
     sheet_url,
-    agent
+    agent,
+    filters
 ):
     print('starting revenue tree process')
     scope = [
@@ -67,11 +68,39 @@ def revenue_tree(
     variable_scoring_df["high_interval"] = variable_scoring_df["high_interval"].astype(float)
     print('spreadsheet data loaded')
 
-    query = f"""
+    if not filters:
+        query = f"""
         SELECT * 
         FROM `{project_id}.{dataset_id}.vs_revenue_tree_customer_sale_type` 
         WHERE client_id = '{client_id}'
-    """
+        """
+    else:
+        query = f""" 
+        SELECT client_id,
+        order_date,
+        customer_type,
+        target_type, 
+        sum(order_revenue) as order_revenue,
+        sum(costs_of_goods) as costs_of_goods,
+        sum(total_costs) as total_costs,
+        sum(order_outbound_cost) as order_outbound_cost,
+        sum(order_discount) as order_discount,
+        sum(item_quantity_with_revenue) as item_quantity_with_revenue,
+        sum(num_orders) as num_orders,
+        sum(num_orders_with_revenue) as num_orders_with_revenue,
+        sum(order_refund) as order_refund,
+        sum(order_total_shipping_costs) as order_total_shipping_costs,
+        sum(item_quantity) as item_quantity,
+        sum(order_shipping_price) as order_shipping_price,
+        sum(order_refund_shipping_costs) as order_refund_shipping_costs
+        FROM `{project_id}.{dataset_id}.vs_revenue_tree_customer_sale_type_with_filters` 
+        WHERE client_id = '{client_id}'
+        """
+
+        query = add_filters_to_query(query, filters)
+        query += "\n GROUP BY 1, 2, 3, 4"
+
+
     df = gbq_client.query(query).to_dataframe()
     df["partition"] = df["customer_type"] + " " + df["target_type"]
 
@@ -87,7 +116,8 @@ def revenue_tree(
     print('Variable rankings ajustado')
 
     if agent == 'agent_1':
-        dates_df = generate_comparison_table(date_str) 
+        dates_df = generate_comparison_table(date_str)
+        dates_df = dates_df.loc[dates_df["date_field"].isin(date_fields_rankings_df["date_field"].unique())] 
         df_treeData = get_revenue_treeData_df(df, dates_df, variable_rankings_df, date_fields_rankings_df, data_partitions_rankings_df, variable_scoring_df)
         treeMath_score = df_treeData["math_eval"].sum()
 
@@ -468,6 +498,8 @@ def get_revenue_treeData_df(
         inplace=True
     )
 
+    result_df = result_df.loc[~ ((result_df['currentvalue'] == 0) & (result_df['comparison_value'] != 0))]
+
     return result_df
 
 
@@ -479,7 +511,8 @@ def marketing_tree(
     date_str,  
     google_sheets_credentials,
     sheet_url,
-    agent
+    agent,
+    filters
 ):
     print('starting marketing tree process')
     scope = [
@@ -524,24 +557,86 @@ def marketing_tree(
     absolute_variable_scoring_df["high_interval"] = absolute_variable_scoring_df["high_interval"].astype(float)
     print('spreadsheet data loaded')
 
-    query = f"""
-    SELECT * 
-    FROM `{project_id}.{dataset_id}.vs_marketing_tree` 
-    WHERE client_id = '{client_id}'
-    """
-    df = gbq_client.query(query).to_dataframe()
+    if not filters:
+
+        query = f"""
+        SELECT * 
+        FROM `{project_id}.{dataset_id}.vs_marketing_tree` 
+        WHERE client_id = '{client_id}'
+        """
+        df = gbq_client.query(query).to_dataframe()
+
+        
+        query = f"""
+        SELECT marketing_channel, order_date, marketing_spend   
+        FROM `{project_id}.{dataset_id}.vs_marketing_tree_channel_mix` 
+        WHERE client_id = '{client_id}'
+        """
+        df_marketing_channel = gbq_client.query(query).to_dataframe()
+
+    else:
+        query = f"""
+        SELECT client_id,
+        order_date,
+        sum(order_revenue) order_revenue,
+        sum(new_customers) new_customers,
+        sum(new_customers_revenue) new_customers_revenue,
+        sum(new_customers_subscribers) new_customers_subscribers,
+        sum(marketing_spend) marketing_spend,
+        sum(marketing_clicks) marketing_clicks,
+        sum(marketing_impressions) marketing_impressions
+        FROM `{project_id}.{dataset_id}.vs_marketing_tree_with_filters` 
+        WHERE client_id = '{client_id}'
+        """
+        query = add_filters_to_query(query, filters)
+        query += "\n GROUP BY 1, 2 "
+        sub_df_1 = gbq_client.query(query).to_dataframe()
+
+        if sub_df_1.empty:
+            results = {
+        'treeName': 'marketing',
+        'response_text': "Marketing data not found for the selected filters. No conclusions needed from this tree. Conclude ignoring this tree"
+        }
+            return results
+
+        if sub_df_1["markeint_spend"].sum() == 0:
+            results = {
+            'treeName': 'marketing',
+            'response_text': "Marketing data not found for the selected filters. No conclusions needed from this tree. Conclude ignoring this tree"
+            }
+            return results
+
+        query = f"""
+        SELECT * 
+        FROM `{project_id}.{dataset_id}.vs_marketing_google_analytics` 
+        WHERE client_id = '{client_id}'
+        """
+        sub_df_2 = gbq_client.query(query).to_dataframe()
+
+        if sub_df_2.empty:
+            df = sub_df_1
+            df["visits"] = 0 
+            df["totalPurchasers"] = 0
+
+        else:
+            df = pd.merge(sub_df_1, sub_df_2, on=["client_id","order_date"], how = "left" )
+
+        for column in ["order_revenue","new_customers","new_customers_revenue","new_customers_subscribers","marketing_spend","marketing_clicks","marketing_impressions","visits","totalPurchasers"]:
+            df[column] = df[column].fillna(0)
+
+
+        query = f"""
+        SELECT marketing_channel, order_date, sum(marketing_spend) marketing_spend   
+        FROM `{project_id}.{dataset_id}.vs_marketing_tree_channel_mix_filters` 
+        WHERE client_id = '{client_id}'
+        """
+        query = add_filters_to_query(query, filters)
+        query += "\n GROUP BY 1, 2"
+        df_marketing_channel = gbq_client.query(query).to_dataframe()
+
 
     if df['order_date'].dtype != 'datetime64[ns]':
-        df['order_date'] = pd.to_datetime(df['order_date'], errors='coerce')
-
-
-    query = f"""
-    SELECT marketing_channel, order_date, marketing_spend   
-    FROM `{project_id}.{dataset_id}.vs_marketing_tree_channel_mix` 
-    WHERE client_id = '{client_id}'
-    """
-    df_marketing_channel = gbq_client.query(query).to_dataframe()
-
+            df['order_date'] = pd.to_datetime(df['order_date'], errors='coerce')
 
     variable_rankings_df = adjust_marketing_variable_rankings_df(df, variable_rankings_df)
     unique_vars = variable_rankings_df["column_name"].unique()
@@ -550,7 +645,8 @@ def marketing_tree(
 
 
     if agent == 'agent_1':
-        dates_df = generate_comparison_table(date_str) 
+        dates_df = generate_comparison_table(date_str)
+        dates_df = dates_df.loc[dates_df["date_field"].isin(date_fields_rankings_df["date_field"].unique())] 
         df_treeData = get_marketing_treeData_df(df, df_marketing_channel, dates_df, variable_rankings_df, date_fields_rankings_df, long_term_weighting_df, change_variable_scoring_df, absolute_variable_scoring_df)
         treeMath_score = df_treeData["math_eval"].sum()
 
@@ -975,8 +1071,8 @@ def get_marketing_treeData_df(
         if col in result_df.columns:
             result_df.drop(columns=col, inplace=True)
 
+    result_df = result_df.loc[~ ((result_df['currentvalue'] == 0) & (result_df['comparison_value'] != 0))]
     return result_df
-
 
 
 
@@ -1004,6 +1100,447 @@ def adjust_marketing_variable_rankings_df(df, variable_rankings_df):
 
 
 
+def add_filters_to_query(base_query: str, filters: dict) -> str:
+    """
+    Función que agrega filtros adicionales (en formato columna IN (...)) a una query SQL.
+    
+    :param base_query: Consulta base, que puede contener o no una cláusula WHERE.
+    :param filters: Diccionario de filtros. Cada clave es el nombre de columna y el valor es una lista de strings.
+    :return: Consulta con los filtros adicionales incluidos.
+    """
+    if not filters:
+        return base_query
+
+    print(base_query, filters)
+
+
+    additional_conditions = []
+    for column, values in filters.items():
+        str_values = ", ".join(f"'{value}'" for value in values)
+        condition = f"{column} IN ({str_values})"
+        additional_conditions.append(condition)
+        
+    filter_clause = " AND ".join(additional_conditions)
+    
+    if "WHERE" in base_query.upper():
+        final_query = f"{base_query}\n  AND {filter_clause}"
+    else:
+        # No existe WHERE en la query, lo agregamos
+        final_query = f"{base_query}\nWHERE {filter_clause}"
+        
+    return final_query
+
+
+
+def cohort_tree(
+    gbq_client, 
+    project_id, 
+    dataset_id, 
+    client_id,  
+    date_str,  
+    google_sheets_credentials,
+    sheet_url,
+    agent,
+    filters
+):
+    print('starting cohort tree process')
+    scope = [
+        'https://spreadsheets.google.com/feeds',
+        'https://www.googleapis.com/auth/drive',
+        'https://www.googleapis.com/auth/drive.file',
+        'https://www.googleapis.com/auth/spreadsheets'
+    ]
+
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(google_sheets_credentials, scope)
+    client_spreed_sheet = gspread.authorize(creds)
+    sheet = client_spreed_sheet.open_by_url(sheet_url)
+
+    variable_rankings = sheet.worksheet("variable_rankings").get_all_values()
+    variable_rankings_df = pd.DataFrame(variable_rankings[1:], columns=variable_rankings[0])
+    variable_rankings_df = variable_rankings_df.applymap(adjust_value_spreedsheet)
+    variable_rankings_df["weight"] = variable_rankings_df["weight"].astype(float)
+    variable_rankings_df["rank"] = variable_rankings_df["rank"].astype(int)
+
+    date_fields_rankings = sheet.worksheet("date_fields_rankings").get_all_values()
+    date_fields_rankings_df = pd.DataFrame(date_fields_rankings[1:], columns=date_fields_rankings[0])
+    date_fields_rankings_df = date_fields_rankings_df.applymap(adjust_value_spreedsheet)
+    date_fields_rankings_df["weight"] = date_fields_rankings_df["weight"].astype(float)
+    date_fields_rankings_df["rank"] = date_fields_rankings_df["rank"].astype(int)
+
+    variable_scoring = sheet.worksheet("variable_scoring").get_all_values()
+    variable_scoring_df = pd.DataFrame(variable_scoring[1:], columns=variable_scoring[0])
+    variable_scoring_df = variable_scoring_df.applymap(adjust_value_spreedsheet)
+    variable_scoring_df["low_interval"] = variable_scoring_df["low_interval"].astype(float)
+    variable_scoring_df["high_interval"] = variable_scoring_df["high_interval"].astype(float)
+    print('spreadsheet data loaded')
+
+    query = f"""
+    SELECT * 
+    FROM `{project_id}.{dataset_id}.itmd_table_for_cohorts` 
+    WHERE client_id = '{client_id}'
+    """
+    df = gbq_client.query(query).to_dataframe()
+    dates_df = generate_comparison_table(date_str) 
+
+    if df['month'].dtype != 'datetime64[ns]':
+        df['month'] = pd.to_datetime(df['month'], errors='coerce')
+
+    if df['cohort_date'].dtype != 'datetime64[ns]':
+        df['cohort_date'] = pd.to_datetime(df['cohort_date'], errors='coerce')
+
+
+    if agent == 'agent_1':
+        dates_df = generate_comparison_table(date_str)
+        dates_df = dates_df.loc[dates_df["date_field"].isin(date_fields_rankings_df["date_field"].unique())] 
+        df_treeData = get_cohort_treeData_df(df, dates_df, variable_rankings_df, date_fields_rankings_df, variable_scoring_df)
+        treeMath_score = df_treeData["math_eval"].sum()
+        treeC7P_df = get_TreeC7P_df(df)
+
+        results = {
+        'treeName': 'cohort',
+        'treeMath_score': treeMath_score,
+        'treeC7P': treeC7P_df.to_dict(orient='records'),
+        'treeData': df_treeData.to_dict(orient='records'),
+        'dates_df': dates_df}
+        
+        return results
+
+
+def get_cohort_treeData_df(
+    df, 
+    dates_df, 
+    variable_rankings_df, 
+    date_fields_rankings_df, 
+    variable_scoring_df
+):
+
+    date_columns = ['start_date', 'end_date', 'start_date_comparison', 'end_date_comparison']
+    for col in date_columns:
+        if dates_df[col].dtype != 'datetime64[ns]':
+            dates_df[col] = pd.to_datetime(dates_df[col], errors='coerce')
+
+    # =========================================================================
+    # 1. Definir funciones de agregación para cada variable solicitada
+    # =========================================================================
+    def cohort_size(df_):
+        """
+        Sum(clients_of_cohort) cuando customer_order_number = 1
+        """
+        return df_.loc[df_['customer_order_number'] == 1, 'clients_of_cohort'].sum()
+
+    def cohort_ltv(df_):
+        """
+        (sum(revenue) - sum(marketing_spend)) / cohort_size
+        """
+        size = cohort_size(df_)
+        if size == 0:
+            return 0
+        return (df_['revenue'].sum() - df_['marketing_spend'].sum()) / size
+
+    def cohort_initial_revenue(df_):
+        """
+        sum(revenue) cuando customer_order_number = 1
+        """
+        return df_.loc[df_['customer_order_number'] == 1, 'revenue'].sum()
+
+    def cohort_supplemental_revenue(df_):
+        """
+        sum(revenue) cuando customer_order_number > 1
+        """
+        return df_.loc[df_['customer_order_number'] > 1, 'revenue'].sum()
+
+    def cohort_total_supplemental_orders(df_):
+        """
+        sum(clients_of_cohort) cuando customer_order_number > 1
+        """
+        return df_.loc[df_['customer_order_number'] > 1, 'clients_of_cohort'].sum()
+
+    def cohort_total_marketing_spend(df_):
+        """
+        sum(marketing_spend)
+        """
+        return df_['marketing_spend'].sum()
+
+    def cohort_ltr(df_):
+        """
+        sum(revenue) / cohort_size
+        """
+        size = cohort_size(df_)
+        if size == 0:
+            return 0
+        return df_['revenue'].sum() / size
+
+    def cohort_subscribers(df_):
+        """
+        sum(clients_of_cohort) cuando customer_order_number = 1 
+        & client_type_lifetime = 'Subscriber'
+        """
+        mask = (
+            (df_['customer_order_number'] == 1) &
+            (df_['client_type_lifetime'] == 'Subscriber')
+        )
+        return df_.loc[mask, 'clients_of_cohort'].sum()
+
+    def cohort_one_off(df_):
+        """
+        sum(clients_of_cohort) cuando customer_order_number = 1 
+        & client_type_lifetime = 'One-Off'
+        """
+        mask = (
+            (df_['customer_order_number'] == 1) &
+            (df_['client_type_lifetime'] == 'One-Off')
+        )
+        return df_.loc[mask, 'clients_of_cohort'].sum()
+
+    def cohort_total_AOV(df_):
+        """
+        sum(revenue) / sum(clients_of_cohort)
+        """
+        total_clients = df_['clients_of_cohort'].sum()
+        if total_clients == 0:
+            return 0
+        return df_['revenue'].sum() / total_clients
+
+    def cohort_supp_AOV(df_):
+        """
+        sum(revenue) / sum(clients_of_cohort) cuando customer_order_number > 1
+        """
+        subset = df_.loc[df_['customer_order_number'] > 1]
+        total_clients = subset['clients_of_cohort'].sum()
+        if total_clients == 0:
+            return 0
+        return subset['revenue'].sum() / total_clients
+
+    def cohort_repur_rate(df_):
+        """
+        sum(clients_of_cohort) cuando customer_order_number = 2 / cohort_size
+        """
+        size = cohort_size(df_)
+        if size == 0:
+            return 0
+        second_order_clients = df_.loc[df_['customer_order_number'] == 2, 'clients_of_cohort'].sum()
+        return second_order_clients / size
+
+    # Diccionario de funciones especiales, mapeando nombre_variable -> función
+    special_vars = {
+        'cohort_size': cohort_size,
+        'cohort_ltv': cohort_ltv,
+        'cohort_initial_revenue': cohort_initial_revenue,
+        'cohort_supplemental_revenue': cohort_supplemental_revenue,
+        'cohort_total_supplemental_orders': cohort_total_supplemental_orders,
+        'cohort_total_marketing_spend': cohort_total_marketing_spend,
+        'cohort_ltr': cohort_ltr,
+        'cohort_subscribers': cohort_subscribers,
+        'cohort_one_off': cohort_one_off,
+        'cohort_total_AOV': cohort_total_AOV,
+        'cohort_supp_AOV': cohort_supp_AOV,
+        'cohort_repur_rate': cohort_repur_rate
+    }
+
+    # =========================================================================
+    # 2. Generar la "cross table" de fechas y variables
+    #    (igual que en el ejemplo, cruzamos dates_df con variable_rankings_df)
+    # =========================================================================
+    cross_df = (
+        dates_df.assign(key=1)
+        .merge(variable_rankings_df.assign(key=1), on='key', suffixes=('', '_var'))
+        .drop(columns=['key'])
+    )
+    # cross_df contiene ahora todas las combinaciones:
+    # [start_date, end_date, start_date_comparison, end_date_comparison] x [column_name]
+
+    # =========================================================================
+    # 3. Iterar sobre cada combinación y calcular currentvalue / comparison_value
+    # =========================================================================
+    rows = []
+
+    for _, row_dates in cross_df.iterrows():
+        date_field = row_dates['date_field']        # Por si usas varios 'date_field' en date_fields_rankings_df
+        column_name = row_dates['column_name']      # La variable (e.g. 'cohort_size')
+        weight_variable_rankings = row_dates['weight']  # Peso de la variable
+
+        # Fechas y rangos
+        start_date = row_dates['start_date']
+        end_date = row_dates['end_date']
+        start_comp = row_dates['start_date_comparison']
+        end_comp = row_dates['end_date_comparison']
+
+        # ---------------------------------------------------------------------
+        # Filtrar df_current y df_comparison
+        # ---------------------------------------------------------------------
+        # Asumiendo: 'cohort_date' se filtra con [start_date, end_date]
+        # y 'month' se filtra con [start_date_comparison, end_date_comparison].
+        df_current = df.loc[
+            (df['cohort_date'] >= start_date) & (df['cohort_date'] <= end_date) &
+            (df['month'] >= start_date) & (df['month'] <= end_date)
+        ]
+
+        df_comparison = df.loc[
+            (df['cohort_date'] >= start_comp) & (df['cohort_date'] <= end_comp) &
+            # En un caso real, puede que la comparación se base en otras columnas,
+            # pero por simplicidad repetimos 'month' con el mismo rango:
+            (df['month'] >= start_comp) & (df['month'] <= end_comp)
+        ]
+
+        # ---------------------------------------------------------------------
+        # Calcular currentvalue y comparison_value
+        # ---------------------------------------------------------------------
+        if column_name in special_vars:
+            func = special_vars[column_name]
+            current_value = func(df_current)
+            comparison_value = func(df_comparison)
+        else:
+            # Si hay alguna variable que no está en special_vars, 
+            # asumimos un sum() directo
+            current_value = df_current[column_name].sum()
+            comparison_value = df_comparison[column_name].sum()
+
+        # ---------------------------------------------------------------------
+        # Calcular change
+        # ---------------------------------------------------------------------
+        if comparison_value == 0:
+            change = 1  # Siguiendo la lógica original: si comp = 0, cambio = 1
+        else:
+            change = (current_value - comparison_value) / comparison_value
+
+        # Crear df con la fila de resultado
+        data_dict = {
+            'variable': column_name,
+            'date_field': date_field,
+            'currentvalue': current_value,
+            'comparison_value': comparison_value,
+            'change': change,
+            'weight_variable_rankings': weight_variable_rankings
+        }
+        rows.append(data_dict)
+
+    # Concatenar todas las filas en un DataFrame
+    result_df = pd.DataFrame(rows)
+
+    # =========================================================================
+    # 4. Merge con los pesos de date_fields_rankings_df (si aplican)
+    # =========================================================================
+    # Se asume que date_fields_rankings_df = [date_field, weight]
+    result_df = result_df.merge(
+        date_fields_rankings_df[['date_field', 'weight']], 
+        on='date_field',
+        how='inner'
+    ).rename(columns={'weight': 'weight_date_fields'})
+
+    # =========================================================================
+    # 5. Asignar 'grade' según variable_scoring_df
+    #    (igual que el ejemplo original)
+    # =========================================================================
+    # Construimos bins y labels para cada variable
+    scoring_dict = {}
+    for var in variable_scoring_df['column_name'].unique():
+        subset = variable_scoring_df[variable_scoring_df['column_name'] == var].sort_values('low_interval')
+        bins = subset['low_interval'].tolist() + [np.inf]
+        labels = subset['grade'].tolist()
+        scoring_dict[var] = (bins, labels)
+
+    def assign_grade(row):
+        var = row['variable']
+        chg = row['change']
+        if var not in scoring_dict or pd.isnull(chg):
+            return np.nan
+        bins, labels = scoring_dict[var]
+        idx = np.searchsorted(bins, chg, side='right') - 1
+        if 0 <= idx < len(labels):
+            return labels[idx]
+        return np.nan
+
+    result_df['grade'] = result_df.apply(assign_grade, axis=1)
+    result_df['weight_variable_rankings'] = result_df['weight_variable_rankings'].fillna(0)
+    result_df['weight_date_fields'] = result_df['weight_date_fields'].fillna(0)
+    result_df['weight'] = result_df['weight_variable_rankings'] * result_df['weight_date_fields']
+
+    # Mapeo de letras a valores numéricos (igual que ejemplo)
+    grade_mapping = {
+        'A+': 100, 'A': 95, 'A-': 90,
+        'B+': 87.5, 'B': 85, 'B-': 80,
+        'C+': 77.5, 'C': 75, 'C-': 70,
+        'D+': 68.5, 'D': 65, 'D-': 62,
+        'F': 50
+    }
+    result_df['grade_numeric'] = result_df['grade'].map(grade_mapping)
+
+    result_df['math_eval'] = result_df['grade_numeric'] * result_df['weight']
+
+    # Si quieres limpiar columnas intermedias:
+    # (en el ejemplo original se hacía un drop)
+    result_df.drop(
+        columns=[
+            'grade_numeric', 
+            'weight_variable_rankings', 
+            'weight_date_fields'
+        ],
+        inplace=True
+    )
+
+    # Orden final de columnas (ajústalo a tu preferencia):
+    columnas_orden = [
+        'variable', 'date_field', 'currentvalue', 'comparison_value', 
+        'change', 'weight', 'math_eval', 'grade'
+    ]
+    otras_columnas = [c for c in result_df.columns if c not in columnas_orden]
+    result_df = result_df[columnas_orden + otras_columnas]
+    result_df = result_df.loc[~ ((result_df['currentvalue'] == 0) & (result_df['comparison_value'] != 0))]
+
+    return result_df
+
+
+def get_TreeC7P_df(df):
+    df_sorted = df.sort_values(by='cohort_date')
+    ultimas_7_fechas = df_sorted['cohort_date'].drop_duplicates().tail(7)
+    df_7 = df_sorted[df_sorted['cohort_date'].isin(ultimas_7_fechas)]
+
+    def calcular_metricas_por_cohort(grupo):
+        # cohort_size: clientes con customer_order_number == 1
+        mask_primera_orden = (grupo['customer_order_number'] == 1)
+        cohort_size = grupo.loc[mask_primera_orden, 'clients_of_cohort'].sum()
+
+        mask_subscriber = mask_primera_orden & (grupo['client_type_lifetime'] == 'Subscriber')
+        cohort_subscribers = grupo.loc[mask_subscriber, 'clients_of_cohort'].sum()
+
+        mask_one_off = mask_primera_orden & (grupo['client_type_lifetime'] == 'One-Off')
+        cohort_one_off = grupo.loc[mask_one_off, 'clients_of_cohort'].sum()
+
+        cohort_initial_revenue = grupo.loc[mask_primera_orden, 'revenue'].sum()
+        total_revenue = grupo['revenue'].sum()
+
+        if cohort_size != 0:
+            cohort_ltr = total_revenue / cohort_size
+        else:
+            cohort_ltr = 0
+
+        mask_supp = (grupo['customer_order_number'] > 1)
+        cohort_total_supp_orders = grupo.loc[mask_supp, 'clients_of_cohort'].sum()
+
+        total_marketing_spend = grupo['marketing_spend'].sum()
+        if cohort_size != 0:
+            cohort_ltv = (total_revenue - total_marketing_spend) / cohort_size
+        else:
+            cohort_ltv = 0
+
+        return pd.Series({
+            'Cohort size': cohort_size,
+            'Cohort subscribers': cohort_subscribers,
+            'Cohort One-off': cohort_one_off,
+            'Cohort Initial Revenue': cohort_initial_revenue,
+            'Cohort LTR': cohort_ltr,
+            'Cohort Total Supplemental Orders': cohort_total_supp_orders,
+            'Cohort LTV': cohort_ltv
+        })
+
+
+    df_grouped = df_7.groupby('cohort_date').apply(calcular_metricas_por_cohort)
+    df_grouped = df_grouped.sort_index()
+    tabla_final = df_grouped.T
+    tabla_final.columns = [ts.strftime('%Y-%m-%d') if isinstance(ts, pd.Timestamp) else ts for ts in tabla_final.columns]
+    return tabla_final
+
+
 
 def generate_comparison_table(input_date_str: str) -> pd.DataFrame:
     """
@@ -1020,6 +1557,56 @@ def generate_comparison_table(input_date_str: str) -> pd.DataFrame:
     prev_2year_date = current_date - relativedelta(years=2)
 
     start_of_current_month = current_date.replace(day=1)
+    start_of_past_month = start_of_current_month - relativedelta(months=1)
+
+    start_of_past_two_months = start_of_past_month - relativedelta(months=1)
+    start_of_past_six_months = start_of_current_month - relativedelta(months=5)
+    start_of_past_fourteen_months = start_of_current_month - relativedelta(months=13)
+
+    start_of_current_month_py = start_of_current_month - relativedelta(years=1)
+    start_of_past_month_py = start_of_past_month - relativedelta(years=1)
+
+    cohort_rows = [
+
+        {
+            "date_field": "recent_trend",
+            "start_date": fmt(start_of_past_month),
+            "end_date": fmt(start_of_current_month),
+            "start_date_comparison": fmt(start_of_past_month_py),
+            "end_date_comparison": fmt(start_of_current_month_py)
+        },
+
+         {
+            "date_field": "6M-to-2M PY",
+            "start_date": fmt(start_of_past_six_months),
+            "end_date": fmt(start_of_past_two_months),
+            "start_date_comparison": fmt(start_of_past_six_months - relativedelta(years=1)),
+            "end_date_comparison": fmt(start_of_past_two_months - relativedelta(years=1))
+        },
+
+        {
+            "date_field": "6M-to-2M P2Y",
+            "start_date": fmt(start_of_past_six_months),
+            "end_date": fmt(start_of_past_two_months),
+            "start_date_comparison": fmt(start_of_past_six_months - relativedelta(years=2)),
+            "end_date_comparison": fmt(start_of_past_two_months - relativedelta(years=2))
+        },
+
+        {
+            "date_field": "TTM-min2 PY",
+            "start_date": fmt(start_of_past_fourteen_months),
+            "end_date": fmt(start_of_past_six_months),
+            "start_date_comparison": fmt(start_of_past_fourteen_months - relativedelta(years=1)),
+            "end_date_comparison": fmt(start_of_past_six_months - relativedelta(years=1))
+        }
+
+    ]
+
+
+
+
+
+
     end_of_prev_month = start_of_current_month - timedelta(days=1)
     start_of_prev_month = end_of_prev_month.replace(day=1)
 
@@ -1216,6 +1803,8 @@ def generate_comparison_table(input_date_str: str) -> pd.DataFrame:
         },
     ]
 
+    rows += cohort_rows
+
     df_result = pd.DataFrame(rows, columns=[
         "date_field", 
         "start_date", 
@@ -1336,6 +1925,8 @@ def main():
         include_index=False,
         include_column_header=True
     )
+
+
 
     return '200'
 
