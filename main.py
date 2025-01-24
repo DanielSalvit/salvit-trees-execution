@@ -1880,6 +1880,7 @@ def main():
     agents_url_df = agents_url_df.applymap(adjust_value_spreedsheet)
 
     sheet_url = agents_url_df[agents_url_df["super_agent"] == tree_name]["url"].iloc[0]
+    filters = {}
 
     tree_result = get_tree_data_by_id(
         tree_name,
@@ -1890,7 +1891,8 @@ def main():
         input_date,
         google_sheets_credentials,
         sheet_url,
-        "agent_1"
+        "agent_1",
+        filters
     )
 
     df_treeData  = pd.DataFrame(tree_result["treeData"])
