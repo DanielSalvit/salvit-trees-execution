@@ -131,57 +131,6 @@ def revenue_tree(
 
 
 
-    base_date = pd.to_datetime(date_str)
-    previous_dates = [(base_date - pd.DateOffset(days=i)).strftime('%Y-%m-%d')  for i in range(0, 29)]
-
-   
-    def process_date(current_date_str):
-        current_dates_df = generate_comparison_table(current_date_str)
-        tree_data_df = get_revenue_treeData_df(
-            df, 
-            current_dates_df, 
-            variable_rankings_df, 
-            date_fields_rankings_df, 
-            data_partitions_rankings_df, 
-            variable_scoring_df
-        )
-        return current_date_str, tree_data_df
-
-    num_cores = multiprocessing.cpu_count()
-    processed_results = Parallel(n_jobs=num_cores)(delayed(process_date)(current_date_str) for current_date_str in previous_dates)
-
-
-    treeData_dict = {}
-    change_dfs = []
-    for current_date_str, tree_data_df in processed_results:
-        if current_date_str == date_str:
-            df_treeData = tree_data_df
-            dates_df = generate_comparison_table(current_date_str)  
-        else:
-            change_dfs.append(tree_data_df)
-
-
-    change_df = pd.concat(change_dfs, ignore_index=True)
-    change_df = (
-        change_df
-        .groupby(['variable', 'date_field', 'partition'], as_index=False)
-        .agg({'change': 'mean'})
-        .reset_index(drop=True)
-        )
-
-    treeMath_score = df_treeData["math_eval"].sum()
-
-    results = {
-        'treeName': 'revenue',
-        'treeMath_score': treeMath_score,
-        'treeData': df_treeData.to_dict(orient='records'),
-        'dates_df': dates_df,
-        'change_df': change_df.to_dict(orient='records') 
-    }
-
-    return results
-
-
 
 
 def adjust_revenue_data_partitions_rankings_df(df, data_partitions_rankings_df):
@@ -1139,10 +1088,12 @@ def cohort_tree(
     client_id,  
     date_str,  
     google_sheets_credentials,
-    sheet_url,
+    url,
     agent,
     filters
 ):
+
+
     print('starting cohort tree process')
     scope = [
         'https://spreadsheets.google.com/feeds',
@@ -1153,7 +1104,7 @@ def cohort_tree(
 
     creds = ServiceAccountCredentials.from_json_keyfile_dict(google_sheets_credentials, scope)
     client_spreed_sheet = gspread.authorize(creds)
-    sheet = client_spreed_sheet.open_by_url(sheet_url)
+    sheet = client_spreed_sheet.open_by_url(url)
 
     variable_rankings = sheet.worksheet("variable_rankings").get_all_values()
     variable_rankings_df = pd.DataFrame(variable_rankings[1:], columns=variable_rankings[0])
@@ -1180,7 +1131,6 @@ def cohort_tree(
     WHERE client_id = '{client_id}'
     """
     df = gbq_client.query(query).to_dataframe()
-    dates_df = generate_comparison_table(date_str) 
 
     if df['month'].dtype != 'datetime64[ns]':
         df['month'] = pd.to_datetime(df['month'], errors='coerce')
@@ -1949,255 +1899,6 @@ def main():
 
     return '200'
 
-def generate_comparison_table(input_date_str: str):
-
-    current_date = pd.to_datetime(input_date_str)
-    
-    def fmt(date_obj):
-        return date_obj.strftime('%Y-%m-%d')
-    
-    prev_date = current_date - timedelta(days=1)
-    prev_year_date = current_date - relativedelta(years=1)
-    prev_2year_date = current_date - relativedelta(years=2)
-    
-    start_of_current_month = current_date.replace(day=1)
-    end_of_prev_month = start_of_current_month - timedelta(days=1)
-    start_of_prev_month = end_of_prev_month.replace(day=1)
-
-    def shift_day_with_clamp(base_date, target_day):
-
-        year = base_date.year
-        month = base_date.month
-        
-        try:
-            new_date = base_date.replace(day=target_day)
-        except ValueError:
-
-            new_date = (base_date.replace(day=1) 
-                        + relativedelta(months=1) 
-                        - relativedelta(days=1))
-        return new_date
-    
-
-    end_of_prev_month_equivalent = shift_day_with_clamp(start_of_prev_month, current_date.day)
-    start_of_last_full_month = start_of_prev_month
-    end_of_last_full_month = end_of_prev_month
-    
-    start_of_month_before_that = start_of_last_full_month - relativedelta(months=1)
-    end_of_month_before_that = start_of_month_before_that.replace(day=1) + relativedelta(months=1, days=-1)
-
-
-    current_quarter = (current_date.month - 1) // 3 + 1
-    start_of_current_quarter_month = 3 * (current_quarter - 1) + 1
-    start_of_current_quarter = current_date.replace(
-        month=start_of_current_quarter_month, 
-        day=1
-    )
-
-    start_of_previous_quarter = start_of_current_quarter - relativedelta(months=3)
-    end_of_previous_quarter_equivalent = shift_day_with_clamp(start_of_previous_quarter, current_date.day)
-    
-    start_of_current_year = current_date.replace(month=1, day=1)
-    start_of_prev_year = start_of_current_year - relativedelta(years=1)
-    start_of_prev_2year = start_of_current_year - relativedelta(years=2)
-    
-    
-    def get_last_completed_week_range(reference_date: pd.Timestamp):
-
-        last_completed_sunday = reference_date - timedelta(days=(reference_date.weekday() + 1))
-        last_completed_monday = last_completed_sunday - timedelta(days=6)
-        return (last_completed_monday, last_completed_sunday)
-    
-
-    wow_current_start, wow_current_end = get_last_completed_week_range(current_date)
-    wow_prev_start = wow_current_start - timedelta(days=7)
-    wow_prev_end = wow_current_end - timedelta(days=7)
-    
-    def shift_week_by_years(week_start, week_end, years):
-        return (week_start - relativedelta(years=years),
-                week_end - relativedelta(years=years))
-    
-    wow_current_start_py, wow_current_end_py = shift_week_by_years(wow_current_start, wow_current_end, 1)
-    wow_current_start_p2y, wow_current_end_p2y = shift_week_by_years(wow_current_start, wow_current_end, 2)
-
-    rows = []
-
-    rows.append({
-        "date_field": "DoD PD",
-        "start_date": fmt(current_date),
-        "end_date": fmt(current_date),
-        "start_date_comparison": fmt(prev_date),
-        "end_date_comparison": fmt(prev_date)
-    })
-
-
-    rows.append({
-        "date_field": "DoD PY",
-        "start_date": fmt(current_date),
-        "end_date": fmt(current_date),
-        "start_date_comparison": fmt(prev_year_date),
-        "end_date_comparison": fmt(prev_year_date)
-    })
-
-    rows.append({
-        "date_field": "DoD P2Y",
-        "start_date": fmt(current_date),
-        "end_date": fmt(current_date),
-        "start_date_comparison": fmt(prev_2year_date),
-        "end_date_comparison": fmt(prev_2year_date)
-    })
-    
-
-    rows.append({
-        "date_field": "MTD PM",
-        "start_date": fmt(start_of_current_month),
-        "end_date": fmt(current_date),
-        "start_date_comparison": fmt(start_of_prev_month),
-        "end_date_comparison": fmt(end_of_prev_month_equivalent)
-    })
-
-
-    rows.append({
-        "date_field": "MTD PY",
-        "start_date": fmt(start_of_current_month),
-        "end_date": fmt(current_date),
-        "start_date_comparison": fmt(start_of_current_month - relativedelta(years=1)),
-        "end_date_comparison": fmt(current_date - relativedelta(years=1))
-    })
-
-    # MTD P2Y
-    rows.append({
-        "date_field": "MTD P2Y",
-        "start_date": fmt(start_of_current_month),
-        "end_date": fmt(current_date),
-        "start_date_comparison": fmt(start_of_current_month - relativedelta(years=2)),
-        "end_date_comparison": fmt(current_date - relativedelta(years=2))
-    })
-
-    rows.append({
-        "date_field": "MoM PM",
-        "start_date": fmt(start_of_last_full_month),
-        "end_date": fmt(end_of_last_full_month),
-        "start_date_comparison": fmt(start_of_month_before_that),
-        "end_date_comparison": fmt(end_of_month_before_that)
-    })
-
-    rows.append({
-        "date_field": "MoM PY",
-        "start_date": fmt(start_of_last_full_month),
-        "end_date": fmt(end_of_last_full_month),
-        "start_date_comparison": fmt(start_of_last_full_month - relativedelta(years=1)),
-        "end_date_comparison": fmt(end_of_last_full_month - relativedelta(years=1))
-    })
-
-
-    rows.append({
-        "date_field": "MoM P2Y",
-        "start_date": fmt(start_of_last_full_month),
-        "end_date": fmt(end_of_last_full_month),
-        "start_date_comparison": fmt(start_of_last_full_month - relativedelta(years=2)),
-        "end_date_comparison": fmt(end_of_last_full_month - relativedelta(years=2))
-    })
-
-    rows.append({
-        "date_field": "QTD PQ",
-        "start_date": fmt(start_of_current_quarter),
-        "end_date": fmt(current_date),
-        "start_date_comparison": fmt(start_of_previous_quarter),
-        "end_date_comparison": fmt(end_of_previous_quarter_equivalent)
-    })
-
-    rows.append({
-        "date_field": "QTD PY",
-        "start_date": fmt(start_of_current_quarter),
-        "end_date": fmt(current_date),
-        "start_date_comparison": fmt(start_of_current_quarter - relativedelta(years=1)),
-        "end_date_comparison": fmt(current_date - relativedelta(years=1))
-    })
-
-    rows.append({
-        "date_field": "QTD P2Y",
-        "start_date": fmt(start_of_current_quarter),
-        "end_date": fmt(current_date),
-        "start_date_comparison": fmt(start_of_current_quarter - relativedelta(years=2)),
-        "end_date_comparison": fmt(current_date - relativedelta(years=2))
-    })
-
-    rows.append({
-        "date_field": "YTD PY",
-        "start_date": fmt(start_of_current_year),
-        "end_date": fmt(current_date),
-        "start_date_comparison": fmt(start_of_prev_year),
-        "end_date_comparison": fmt(current_date - relativedelta(years=1))
-    })
-
-    rows.append({
-        "date_field": "YTD P2Y",
-        "start_date": fmt(start_of_current_year),
-        "end_date": fmt(current_date),
-        "start_date_comparison": fmt(start_of_prev_2year),
-        "end_date_comparison": fmt(current_date - relativedelta(years=2))
-    })
-
-    rows.append({
-        "date_field": "WoW PW",
-        "start_date": fmt(wow_current_start),
-        "end_date": fmt(wow_current_end),
-        "start_date_comparison": fmt(wow_prev_start),
-        "end_date_comparison": fmt(wow_prev_end)
-    })
-
-    wow_py_start, wow_py_end = wow_current_start_py, wow_current_end_py
-    rows.append({
-        "date_field": "WoW PY",
-        "start_date": fmt(wow_current_start),
-        "end_date": fmt(wow_current_end),
-        "start_date_comparison": fmt(wow_py_start),
-        "end_date_comparison": fmt(wow_py_end)
-    })
-
-
-    wow_p2y_start, wow_p2y_end = wow_current_start_p2y, wow_current_end_p2y
-    rows.append({
-        "date_field": "WoW P2Y",
-        "start_date": fmt(wow_current_start),
-        "end_date": fmt(wow_current_end),
-        "start_date_comparison": fmt(wow_p2y_start),
-        "end_date_comparison": fmt(wow_p2y_end)
-    })
-
-    l3d_end_date = current_date - timedelta(days=1)
-    l3d_start_date = current_date - timedelta(days=4)
-    l3d_end_date_comp = l3d_start_date - timedelta(days=1)
-    l3d_start_date_comp = l3d_end_date_comp - timedelta(days=2)
-    
-    rows.append({
-        "date_field": "L3D P3D",
-        "start_date": fmt(l3d_start_date),
-        "end_date": fmt(l3d_end_date),
-        "start_date_comparison": fmt(l3d_start_date_comp),
-        "end_date_comparison": fmt(l3d_end_date_comp)
-    })
-
-
-    rows.append({
-        "date_field": "L3D PY",
-        "start_date": fmt(l3d_start_date),
-        "end_date": fmt(l3d_end_date),
-        "start_date_comparison": fmt(l3d_start_date - relativedelta(years=1)),
-        "end_date_comparison": fmt(l3d_end_date - relativedelta(years=1))
-    })
-
-
-    df = pd.DataFrame(rows, columns=[
-        "date_field",
-        "start_date",
-        "end_date",
-        "start_date_comparison",
-        "end_date_comparison"
-    ])
-
-    return df
 
 
 if __name__ == "__main__":
