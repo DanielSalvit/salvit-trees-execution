@@ -1817,7 +1817,8 @@ def generate_comparison_table(input_date_str: str) -> pd.DataFrame:
 def get_tree_data_by_id(tree_id, *args):
     trees = {
         'revenue': revenue_tree,
-        'marketing': marketing_tree
+        'marketing': marketing_tree,
+        'cohort': cohort_tree
     }
     if tree_id in trees:
         return trees[tree_id](*args)
@@ -1925,6 +1926,22 @@ def main():
         include_index=False,
         include_column_header=True
     )
+
+    if "treeC7P" in tree_result.keys():
+
+        treeC7P_df = tree_result["treeC7P"]
+        treeC7P_df["client_id"] = client_id
+        worksheet = sheet.worksheet('treeC7P')
+        worksheet.clear()
+
+        set_with_dataframe(
+            worksheet,
+            treeC7P_df,
+            row=1,
+            col=1,
+            include_index=True,
+            include_column_header=True
+        )
 
 
 
